@@ -26,6 +26,18 @@ NEWSDATA_BASE_URL = "https://newsdata.io/api/1/latest"
 # NewsData keyword/search parameters have a 100-character limit.
 NEWSDATA_QUERY_MAX_LENGTH = 100
 
+# NewsData's request already asks for language=en, but keep a second local
+# safeguard in case the provider occasionally misclassifies or leaks a
+# non-English result into the response.
+ENGLISH_LANGUAGE_VALUES = {
+    "english",
+    "en",
+    "en-us",
+    "en_us",
+    "en-gb",
+    "en_gb",
+}
+
 # Priority search:
 # - Search specifically for actual recall headlines first.
 # - Restrict results to NewsData's health + food categories.
@@ -227,6 +239,50 @@ def _validate_newsdata_search_params(params: dict[str, Any]) -> None:
             )
 
 
+def _is_english_newsdata_item(item: dict[str, Any]) -> bool:
+    """
+    Local language guard on top of NewsData's language=en request parameter.
+
+    NewsData currently reports article language using values such as
+    "english". Accept a few common English-code variants defensively, but
+    reject missing or explicitly non-English values so only confirmed-English
+    articles move farther into the GermFx relevance pipeline.
+    """
+    raw_language = item.get("language")
+
+    if isinstance(raw_language, list):
+        values = {
+            str(value).strip().lower()
+            for value in raw_language
+            if value is not None
+        }
+        return bool(values & ENGLISH_LANGUAGE_VALUES)
+
+    language = str(raw_language or "").strip().lower()
+    return language in ENGLISH_LANGUAGE_VALUES
+
+
+def _filter_english_payloads(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    english_items: list[dict[str, Any]] = []
+
+    for item in items:
+        if _is_english_newsdata_item(item):
+            english_items.append(item)
+            continue
+
+        title = str(item.get("title") or "Untitled article")
+        language = item.get("language")
+
+        print(
+            "Article sync rejected non-English result: "
+            f"language={language!r}, title={title}"
+        )
+
+    return english_items
+
+
 def _fetch_newsdata(params: dict[str, Any]) -> list[dict[str, Any]]:
     if not NEWSDATA_API_KEY:
         raise RuntimeError("NEWSDATA_API_KEY is not configured")
@@ -269,7 +325,11 @@ def _fetch_newsdata(params: dict[str, Any]) -> list[dict[str, Any]]:
         raise RuntimeError(f"NewsData.io error: {data}")
 
     results = data.get("results", [])
-    return results if isinstance(results, list) else []
+
+    if not isinstance(results, list):
+        return []
+
+    return _filter_english_payloads(results)
 
 
 def fetch_recall_article_payloads() -> list[dict[str, Any]]:
