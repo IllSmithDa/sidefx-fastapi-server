@@ -26,9 +26,8 @@ NEWSDATA_BASE_URL = "https://newsdata.io/api/1/latest"
 # NewsData keyword/search parameters have a 100-character limit.
 NEWSDATA_QUERY_MAX_LENGTH = 100
 
-# NewsData's request already asks for language=en, but keep a second local
-# safeguard in case the provider occasionally misclassifies or leaks a
-# non-English result into the response.
+# NewsData is already queried with language=en, but keep a local safeguard
+# against rare provider-side language classification leaks.
 ENGLISH_LANGUAGE_VALUES = {
     "english",
     "en",
@@ -36,6 +35,15 @@ ENGLISH_LANGUAGE_VALUES = {
     "en_us",
     "en-gb",
     "en_gb",
+}
+
+# Local ranking preference only. Non-U.S. stories are NOT rejected.
+# U.S.-tagged NewsData results are simply considered first.
+US_COUNTRY_VALUES = {
+    "us",
+    "usa",
+    "united states",
+    "united states of america",
 }
 
 # Priority search:
@@ -240,14 +248,6 @@ def _validate_newsdata_search_params(params: dict[str, Any]) -> None:
 
 
 def _is_english_newsdata_item(item: dict[str, Any]) -> bool:
-    """
-    Local language guard on top of NewsData's language=en request parameter.
-
-    NewsData currently reports article language using values such as
-    "english". Accept a few common English-code variants defensively, but
-    reject missing or explicitly non-English values so only confirmed-English
-    articles move farther into the GermFx relevance pipeline.
-    """
     raw_language = item.get("language")
 
     if isinstance(raw_language, list):
@@ -281,6 +281,42 @@ def _filter_english_payloads(
         )
 
     return english_items
+
+
+def _is_us_newsdata_item(item: dict[str, Any]) -> bool:
+    """
+    Return True when NewsData tags a result as U.S.-based.
+
+    This is only a ranking signal. Missing or non-U.S. country metadata
+    remains fully eligible for the feed.
+    """
+    raw_country = item.get("country")
+
+    if isinstance(raw_country, list):
+        values = {
+            str(value).strip().lower()
+            for value in raw_country
+            if value is not None
+        }
+        return bool(values & US_COUNTRY_VALUES)
+
+    country = str(raw_country or "").strip().lower()
+    return country in US_COUNTRY_VALUES
+
+
+def _prioritize_us_payloads(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Stable local ranking: U.S.-tagged stories first, then all others.
+
+    Python's sort is stable, so NewsData's existing ordering is preserved
+    within each group.
+    """
+    return sorted(
+        items,
+        key=lambda item: 0 if _is_us_newsdata_item(item) else 1,
+    )
 
 
 def _fetch_newsdata(params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -635,7 +671,9 @@ def fetch_prioritized_article_payloads() -> tuple[
         feed_name="recall",
         predicate=_is_recall_relevant,
     )
-    recall_candidates = _dedupe_payloads(recall_relevant)
+    recall_candidates = _prioritize_us_payloads(
+        _dedupe_payloads(recall_relevant)
+    )
 
     selected: list[dict[str, Any]] = []
     _add_diverse_articles(
@@ -647,6 +685,7 @@ def fetch_prioritized_article_payloads() -> tuple[
     recall_selected_count = len(selected)
     general_raw: list[dict[str, Any]] = []
     general_relevant: list[dict[str, Any]] = []
+    general_candidates: list[dict[str, Any]] = []
 
     if len(selected) < TARGET_ARTICLES_PER_SYNC:
         general_raw = fetch_general_article_payloads()
@@ -656,7 +695,9 @@ def fetch_prioritized_article_payloads() -> tuple[
             feed_name="general",
             predicate=_is_general_health_relevant,
         )
-        general_candidates = _dedupe_payloads(general_relevant)
+        general_candidates = _prioritize_us_payloads(
+            _dedupe_payloads(general_relevant)
+        )
 
         _add_diverse_articles(
             selected,
@@ -667,10 +708,19 @@ def fetch_prioritized_article_payloads() -> tuple[
     stats = {
         "recall_returned": len(recall_raw),
         "recall_relevant": len(recall_relevant),
+        "recall_us_candidates": sum(
+            1 for item in recall_candidates if _is_us_newsdata_item(item)
+        ),
         "recall_selected": recall_selected_count,
         "general_returned": len(general_raw),
         "general_relevant": len(general_relevant),
+        "general_us_candidates": sum(
+            1 for item in general_candidates if _is_us_newsdata_item(item)
+        ),
         "selected": len(selected),
+        "selected_us": sum(
+            1 for item in selected if _is_us_newsdata_item(item)
+        ),
     }
 
     print(f"Article sync stats: {stats}")
