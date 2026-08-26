@@ -2,7 +2,10 @@
 
 from app.db import Base
 
-from app.models.users import User
+from app.models.users import (
+    User,
+    UserOAuthIdentity,
+)
 
 from app.models.symptoms import (
     Symptom,
@@ -43,7 +46,7 @@ from app.models.cooldowns import (
 )
 
 from app.models.user_feedback import (
-  UserFeedback
+    UserFeedback,
 )
 
 __all__ = [
@@ -66,5 +69,6 @@ __all__ = [
   "UserUsageCounter",
   "RequestCooldown",
   "EmailRequestCooldown",
-  "UserFeedback"
+  "UserFeedback",
+  "UserOAuthIdentity"
 ]

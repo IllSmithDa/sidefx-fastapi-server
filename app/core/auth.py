@@ -25,6 +25,12 @@ from app.util.security import hash_email, verify_password
 SECRET_KEY = os.getenv("JWT_SECRET", "dev-only-secret-change-me")
 ALGORITHM = "HS256"
 
+RECENT_AUTH_COOKIE = "germfx_recent_auth"
+RECENT_AUTH_TOKEN_TYPE = "recent_auth"
+RECENT_AUTH_TOKEN_SECONDS = int(
+    os.getenv("RECENT_AUTH_TOKEN_SECONDS", "600")
+)
+
 
 def create_access_token(
     data: dict,
@@ -45,6 +51,133 @@ def create_refresh_token(data: dict) -> str:
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
+def create_recent_auth_token(
+    *,
+    user_id: int | str,
+    token_version: int,
+    provider: str,
+) -> str:
+    """
+    Create a short-lived proof that an already-authenticated user recently
+    confirmed their identity through a supported authentication provider.
+
+    This token is NOT an access token and must never be accepted as one.
+    """
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(seconds=RECENT_AUTH_TOKEN_SECONDS)
+
+    payload = {
+        "sub": str(user_id),
+        "tv": int(token_version),
+        "provider": str(provider).strip().lower(),
+        "iat": now,
+        "exp": exp,
+        "type": RECENT_AUTH_TOKEN_TYPE,
+    }
+
+    return jwt.encode(
+        payload,
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+
+def verify_recent_auth_for_user(
+    token: str | None,
+    *,
+    user: models.User,
+    allowed_providers: set[str] | None = None,
+) -> dict:
+    """
+    Verify a recent-auth proof against the currently authenticated GermFx user.
+
+    The proof must:
+    - be a recent_auth JWT,
+    - belong to this exact user,
+    - carry the user's current token_version,
+    - optionally use one of the allowed providers.
+    """
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "message": "Please verify your identity before continuing.",
+                "code": "RECENT_AUTH_REQUIRED",
+            },
+        )
+
+    try:
+        payload = jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=[ALGORITHM],
+        )
+    except JWTError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "message": (
+                    "Your recent identity verification is invalid or has expired. "
+                    "Please verify again."
+                ),
+                "code": "RECENT_AUTH_INVALID",
+            },
+        ) from exc
+
+    if payload.get("type") != RECENT_AUTH_TOKEN_TYPE:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "message": "Invalid recent identity verification.",
+                "code": "RECENT_AUTH_INVALID",
+            },
+        )
+
+    if str(payload.get("sub") or "") != str(user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "message": "Recent identity verification does not match this account.",
+                "code": "RECENT_AUTH_USER_MISMATCH",
+            },
+        )
+
+    try:
+        token_version = int(payload.get("tv"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "message": "Invalid recent identity verification.",
+                "code": "RECENT_AUTH_INVALID",
+            },
+        ) from exc
+
+    if token_version != int(user.token_version):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "message": "Recent identity verification has been revoked.",
+                "code": "RECENT_AUTH_REVOKED",
+            },
+        )
+
+    provider = str(payload.get("provider") or "").strip().lower()
+
+    if allowed_providers is not None and provider not in allowed_providers:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "message": "This identity verification method cannot be used here.",
+                "code": "RECENT_AUTH_PROVIDER_INVALID",
+            },
+        )
+
+    ensure_user_can_authenticate(user)
+
+    return payload
+
+
 def verify_token(token: str, token_type: str = "access") -> dict:
     """
     Decodes and validates the token and enforces the expected token type.
@@ -55,24 +188,14 @@ def verify_token(token: str, token_type: str = "access") -> dict:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         token_payload_type = payload.get("type")
 
-        if token_type == "refresh":
-            if token_payload_type != "refresh":
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail={
-                        "message": "Invalid token type.",
-                        "code": "INVALID_TOKEN_TYPE",
-                    },
-                )
-        else:
-            if token_payload_type == "refresh":
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail={
-                        "message": "Invalid token type.",
-                        "code": "INVALID_TOKEN_TYPE",
-                    },
-                )
+        if token_payload_type != token_type:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={
+                    "message": "Invalid token type.",
+                    "code": "INVALID_TOKEN_TYPE",
+                },
+            )
 
         return payload
     except HTTPException:
@@ -142,7 +265,11 @@ def verify_user(identifier: str, password: str, db: Session) -> models.User:
 
     user = db.execute(query).scalars().first()
 
-    if not user or not verify_password(password, user.password_hash):
+    if (
+        not user
+        or not user.password_hash
+        or not verify_password(password, user.password_hash)
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={

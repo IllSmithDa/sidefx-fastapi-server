@@ -22,11 +22,13 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.core.auth import (
+    RECENT_AUTH_COOKIE,
     _extract_bearer_token,
     create_access_token,
     create_refresh_token,
     ensure_user_can_authenticate,
     get_authenticated_user,
+    verify_recent_auth_for_user,
     verify_token,
     verify_user,
 )
@@ -56,6 +58,7 @@ from app.schemas.users import (
     ChangeEmailRequest,
     ChangePasswordRequest,
     ChangeUsernameRequest,
+    SetPasswordRequest,
     UserCreate,
     UserLogin,
     UserOut,
@@ -199,6 +202,11 @@ def login_user(
             "is_email_verified": user.is_email_verified,
             "account_status": getattr(user, "account_status", None),
             "created_at": user.created_at,
+            "has_password": bool(user.password_hash),
+            "oauth_providers": _oauth_providers_for_user(
+                db,
+                user.id,
+            ),
         },
         "access_token": access_token,
         "refresh_token": refresh_token,
@@ -313,8 +321,30 @@ def refresh_access_token(
     }
 
 
+def _oauth_providers_for_user(
+    db: Session,
+    user_id: int,
+) -> list[str]:
+    providers = db.execute(
+        select(models.UserOAuthIdentity.provider).where(
+            models.UserOAuthIdentity.user_id == user_id
+        )
+    ).scalars().all()
+
+    return sorted(
+        {
+            str(provider).strip().lower()
+            for provider in providers
+            if provider
+        }
+    )
+
+
 @router.get("/me")
-def me(current_user: models.User = Depends(get_authenticated_user)):
+def me(
+    current_user: models.User = Depends(get_authenticated_user),
+    db: Session = Depends(get_db),
+):
     email = None
 
     try:
@@ -334,6 +364,11 @@ def me(current_user: models.User = Depends(get_authenticated_user)):
         "account_status": getattr(current_user, "account_status", None),
         "created_at": current_user.created_at,
         "role": current_user.role,
+        "has_password": bool(current_user.password_hash),
+        "oauth_providers": _oauth_providers_for_user(
+            db,
+            current_user.id,
+        ),
         "subscription": subscription,
         "is_plus": subscription["is_plus"],
         "subscription_plan": subscription["plan"],
@@ -384,20 +419,203 @@ def logout(
     return
 
 
+def _verify_account_setting_identity(
+    *,
+    current_user: models.User,
+    current_password: str | None,
+    recent_auth_token: str | None,
+) -> str:
+    """
+    Verify a sensitive account-settings action.
+
+    Returns the verification method used: "password" or "google".
+
+    If the caller explicitly supplies a password, that password must be
+    correct. We do not silently fall back to an existing recent-auth cookie
+    after an incorrect password attempt.
+    """
+    supplied_password = (
+        current_password.strip()
+        if isinstance(current_password, str)
+        else ""
+    )
+
+    if supplied_password:
+        if not current_user.password_hash:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "message": (
+                        "This account does not have a GermFx password. "
+                        "Verify your identity with Google instead."
+                    ),
+                    "code": "PASSWORD_NOT_SET",
+                },
+            )
+
+        if not verify_password(
+            supplied_password,
+            current_user.password_hash,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "message": "Current password is incorrect.",
+                    "code": "CURRENT_PASSWORD_INCORRECT",
+                },
+            )
+
+        return "password"
+
+    verify_recent_auth_for_user(
+        recent_auth_token,
+        user=current_user,
+        allowed_providers={"google"},
+    )
+
+    return "google"
+
+
+def _clear_recent_auth_cookie(
+    response: Response,
+) -> None:
+    response.delete_cookie(
+        key=RECENT_AUTH_COOKIE,
+        path=COOKIE_PATH,
+    )
+
+
 @router.post("/change-password", status_code=status.HTTP_200_OK)
 def change_password(
     payload: ChangePasswordRequest,
     response: Response,
+    recent_auth_token: str | None = Cookie(
+        default=None,
+        alias=RECENT_AUTH_COOKIE,
+    ),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_authenticated_user),
 ):
-    if not verify_password(payload.current_password, current_user.password_hash):
+    """
+    Change an existing GermFx password.
+
+    A password-only user verifies with their current password.
+    A user who also has a linked Google identity may instead complete recent
+    Google reauthentication and omit current_password.
+    """
+    if not current_user.password_hash:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Current password is incorrect",
+            detail={
+                "message": (
+                    "This account does not currently have a GermFx password. "
+                    "Use Set Password instead."
+                ),
+                "code": "PASSWORD_NOT_SET",
+            },
         )
 
+    _verify_account_setting_identity(
+        current_user=current_user,
+        current_password=payload.current_password,
+        recent_auth_token=recent_auth_token,
+    )
+
     password_error = validate_new_password(payload.new_password)
+    if password_error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=password_error,
+        )
+
+    if verify_password(
+        payload.new_password,
+        current_user.password_hash,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "message": (
+                    "New password must be different from your current password."
+                ),
+                "code": "PASSWORD_UNCHANGED",
+            },
+        )
+
+    enforce_and_mark_user_cooldown(
+        db=db,
+        user_id=current_user.id,
+        action_key="change_password",
+        cooldown_seconds=300,
+        message="Please wait before changing your password again.",
+        commit=False,
+    )
+
+    current_user.password_hash = hash_password(
+        payload.new_password
+    )
+    current_user.token_version += 1
+
+    db.add(current_user)
+    db.commit()
+    db.refresh(current_user)
+
+    # token_version changed, so every existing auth token is revoked. Clear the
+    # browser copies too, including recent-auth.
+    response.delete_cookie(
+        key=ACCESS_COOKIE,
+        path=COOKIE_PATH,
+    )
+    response.delete_cookie(
+        key=REFRESH_COOKIE,
+        path=COOKIE_PATH,
+    )
+    _clear_recent_auth_cookie(response)
+
+    return {
+        "message": "Password changed successfully. Please log in again.",
+        "code": "PASSWORD_CHANGED",
+    }
+
+
+@router.post("/set-password", status_code=status.HTTP_200_OK)
+def set_password(
+    payload: SetPasswordRequest,
+    response: Response,
+    recent_auth_token: str | None = Cookie(
+        default=None,
+        alias=RECENT_AUTH_COOKIE,
+    ),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_authenticated_user),
+):
+    """
+    Add the first GermFx password to an OAuth-only account.
+
+    This endpoint cannot change an existing password. The user must prove
+    ownership through recent Google reauthentication.
+    """
+    if current_user.password_hash:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": (
+                    "This account already has a GermFx password. "
+                    "Use Change Password instead."
+                ),
+                "code": "PASSWORD_ALREADY_SET",
+            },
+        )
+
+    verify_recent_auth_for_user(
+        recent_auth_token,
+        user=current_user,
+        allowed_providers={"google"},
+    )
+
+    password_error = validate_new_password(
+        payload.new_password
+    )
     if password_error:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -413,17 +631,32 @@ def change_password(
         commit=False,
     )
 
-    current_user.password_hash = hash_password(payload.new_password)
+    current_user.password_hash = hash_password(
+        payload.new_password
+    )
     current_user.token_version += 1
 
     db.add(current_user)
     db.commit()
     db.refresh(current_user)
 
-    response.delete_cookie(key=ACCESS_COOKIE, path=COOKIE_PATH)
-    response.delete_cookie(key=REFRESH_COOKIE, path=COOKIE_PATH)
+    response.delete_cookie(
+        key=ACCESS_COOKIE,
+        path=COOKIE_PATH,
+    )
+    response.delete_cookie(
+        key=REFRESH_COOKIE,
+        path=COOKIE_PATH,
+    )
+    _clear_recent_auth_cookie(response)
 
-    return {"message": "Password changed successfully. Please log in again."}
+    return {
+        "message": (
+            "GermFx password set successfully. "
+            "Please log in again."
+        ),
+        "code": "PASSWORD_SET",
+    }
 
 
 @router.post("/change-username", response_model=UserOut, status_code=status.HTTP_200_OK)
@@ -477,17 +710,31 @@ def change_username(
 @router.post("/change-email", status_code=status.HTTP_200_OK)
 def request_email_change(
     payload: ChangeEmailRequest,
+    response: Response,
     background: BackgroundTasks,
+    recent_auth_token: str | None = Cookie(
+        default=None,
+        alias=RECENT_AUTH_COOKIE,
+    ),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_authenticated_user),
 ):
-    new_email = canonicalize_email(payload.new_email)
+    """
+    Request an email change after fresh identity verification.
 
-    if not verify_password(payload.current_password, current_user.password_hash):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Current password is incorrect",
-        )
+    Password accounts may use their current GermFx password. Google-only
+    accounts, and dual-auth users who choose Google, may use a valid recent
+    Google reauthentication cookie instead.
+    """
+    new_email = canonicalize_email(
+        payload.new_email
+    )
+
+    _verify_account_setting_identity(
+        current_user=current_user,
+        current_password=payload.current_password,
+        recent_auth_token=recent_auth_token,
+    )
 
     email_error = validate_new_email(new_email)
     if email_error:
@@ -497,7 +744,11 @@ def request_email_change(
         )
 
     try:
-        current_email = canonicalize_email(decrypt_email(current_user.email_enc))
+        current_email = canonicalize_email(
+            decrypt_email(
+                current_user.email_enc
+            )
+        )
     except Exception:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -513,10 +764,17 @@ def request_email_change(
     new_email_hash = hash_email(new_email)
 
     existing_user = db.execute(
-        select(models.User).where(models.User.email_hash == new_email_hash)
+        select(models.User).where(
+            models.User.email_hash
+            == new_email_hash
+        )
     ).scalars().first()
 
-    if existing_user and existing_user.id != current_user.id:
+    if (
+        existing_user
+        and existing_user.id
+        != current_user.id
+    ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Email already in use",
@@ -527,7 +785,10 @@ def request_email_change(
         user_id=current_user.id,
         action_key="change_email",
         cooldown_seconds=300,
-        message="Please wait before requesting another email change.",
+        message=(
+            "Please wait before requesting "
+            "another email change."
+        ),
         commit=True,
     )
 
@@ -537,8 +798,13 @@ def request_email_change(
         new_email=new_email,
     )
 
-    link = _email_change_verification_link(token)
-    html = change_email_verification_html(link, new_email)
+    link = _email_change_verification_link(
+        token
+    )
+    html = change_email_verification_html(
+        link,
+        new_email,
+    )
 
     background.add_task(
         send_email,
@@ -547,8 +813,16 @@ def request_email_change(
         html,
     )
 
+    # Consume the browser copy of recent Google verification after a successful
+    # email-change request. Password verification is unaffected by this.
+    _clear_recent_auth_cookie(response)
+
     return {
-        "message": "Verification email sent. Please check your new email address to complete the change.",
+        "message": (
+            "Verification email sent. Please check your new email address "
+            "to complete the change."
+        ),
+        "code": "EMAIL_CHANGE_VERIFICATION_SENT",
     }
 
 
@@ -623,8 +897,15 @@ def verify_email_change(
     db.refresh(user)
 
     if response:
-        response.delete_cookie(key=ACCESS_COOKIE, path=COOKIE_PATH)
-        response.delete_cookie(key=REFRESH_COOKIE, path=COOKIE_PATH)
+        response.delete_cookie(
+            key=ACCESS_COOKIE,
+            path=COOKIE_PATH,
+        )
+        response.delete_cookie(
+            key=REFRESH_COOKIE,
+            path=COOKIE_PATH,
+        )
+        _clear_recent_auth_cookie(response)
 
     return {
         "message": "Email changed successfully. Please log in again with your new email.",

@@ -1,99 +1,58 @@
-from datetime import datetime, timezone
+from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy import select, func
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Response,
+    status,
+)
 from sqlalchemy.orm import Session
+
 from app import models
+from app.core.auth import (
+    create_access_token,
+    create_refresh_token,
+)
+from app.core.auth_config import (
+    ACCESS_COOKIE,
+    ACCESS_TOKEN_SECONDS,
+    COOKIE_PATH,
+    COOKIE_SAMESITE,
+    COOKIE_SECURE,
+    REFRESH_COOKIE,
+    REFRESH_TOKEN_SECONDS,
+)
 from app.db import get_db
 from app.schemas.users import ReactivateAccountRequest
+from app.services.account_recovery import (
+    AccountReactivationError,
+    find_user_for_reactivation,
+    reactivate_user_account,
+)
 from app.util.security import verify_password
-from app.core.auth import create_access_token, create_refresh_token
-from app.util.security import canonicalize_email, hash_email
+
 
 router = APIRouter(tags=["account-recovery"])
 
-ACCESS_COOKIE = "access_token"
-REFRESH_COOKIE = "refresh_token"
-COOKIE_PATH = "/"
-COOKIE_SECURE = False  # replace with your config
-COOKIE_SAMESITE = "lax"  # replace with your config
-ACCESS_MAX_AGE = 60 * 60
-REFRESH_MAX_AGE = 30 * 24 * 60 * 60
 
-
-@router.post("/reactivate-account", status_code=status.HTTP_200_OK)
-def reactivate_account(
-    payload: ReactivateAccountRequest,
+def _issue_user_session(
+    user: models.User,
     response: Response,
-    db: Session = Depends(get_db),
-):
-    identifier = payload.identifier.strip()
+) -> tuple[str, str]:
+    access_token = create_access_token(
+        {
+            "sub": str(user.id),
+            "tv": user.token_version,
+        }
+    )
 
-    user = None
-
-    # Adjust this logic if you already have a shared "find by identifier" helper
-    if "@" in identifier:
-
-        normalized_email = canonicalize_email(identifier)
-        email_hash = hash_email(normalized_email)
-
-        user = db.execute(
-            select(models.User).where(models.User.email_hash == email_hash)
-        ).scalars().first()
-    else:
-
-        user = db.execute(
-            select(models.User).where(func.lower(models.User.username) == identifier.lower())
-        ).scalars().first()
-
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Account not found",
-        )
-
-    if not verify_password(payload.password, user.password_hash):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid credentials",
-        )
-
-    if getattr(user, "account_status", "active") == "suspended":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This account has been suspended and cannot be reactivated here.",
-        )
-
-    if user.is_active and getattr(user, "account_status", "active") == "active":
-        return {"message": "Account is already active."}
-
-    user.is_active = True
-    user.account_status = "active"
-
-    if hasattr(user, "deactivated_at"):
-        user.deactivated_at = None
-
-    if hasattr(user, "suspended_at"):
-        user.suspended_at = None
-
-    if hasattr(user, "suspension_reason"):
-        user.suspension_reason = None
-
-    if hasattr(user, "token_version"):
-        user.token_version += 1
-
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-
-    access_token = create_access_token({
-        "sub": str(user.id),
-        "tv": user.token_version,
-    })
-    refresh_token = create_refresh_token({
-        "sub": str(user.id),
-        "tv": user.token_version,
-    })
+    refresh_token = create_refresh_token(
+        {
+            "sub": str(user.id),
+            "tv": user.token_version,
+        }
+    )
 
     response.set_cookie(
         key=ACCESS_COOKIE,
@@ -101,17 +60,105 @@ def reactivate_account(
         httponly=True,
         secure=COOKIE_SECURE,
         samesite=COOKIE_SAMESITE,
-        max_age=ACCESS_MAX_AGE,
+        max_age=ACCESS_TOKEN_SECONDS,
         path=COOKIE_PATH,
     )
+
     response.set_cookie(
         key=REFRESH_COOKIE,
         value=refresh_token,
         httponly=True,
         secure=COOKIE_SECURE,
         samesite=COOKIE_SAMESITE,
-        max_age=REFRESH_MAX_AGE,
+        max_age=REFRESH_TOKEN_SECONDS,
         path=COOKIE_PATH,
     )
 
-    return {"message": "Account reactivated successfully."}
+    return access_token, refresh_token
+
+
+@router.post(
+    "/reactivate-account",
+    status_code=status.HTTP_200_OK,
+)
+def reactivate_account(
+    payload: ReactivateAccountRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """
+    Password-based account reactivation.
+
+    OAuth-only users intentionally do not pass through this route. They use the
+    Google OAuth flow with intent=reactivate so the immutable linked Google sub
+    can prove account ownership.
+    """
+    identifier = payload.identifier.strip()
+
+    user = find_user_for_reactivation(
+        db,
+        identifier,
+    )
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "message": "Account not found.",
+                "code": "ACCOUNT_NOT_FOUND",
+            },
+        )
+
+    if not user.password_hash:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "message": (
+                    "This account does not have a GermFx password. "
+                    "Use Google to reactivate the account."
+                ),
+                "code": "PASSWORD_NOT_SET",
+            },
+        )
+
+    if not verify_password(
+        payload.password,
+        user.password_hash,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "message": "Invalid credentials.",
+                "code": "INVALID_CREDENTIALS",
+            },
+        )
+
+    try:
+        result = reactivate_user_account(
+            db,
+            user,
+        )
+    except AccountReactivationError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={
+                "message": exc.message,
+                "code": exc.code,
+            },
+        ) from exc
+
+    if result.already_active:
+        return {
+            "message": "Account is already active.",
+            "code": "ACCOUNT_ALREADY_ACTIVE",
+        }
+
+    _issue_user_session(
+        result.user,
+        response,
+    )
+
+    return {
+        "message": "Account reactivated successfully.",
+        "code": "ACCOUNT_REACTIVATED",
+    }

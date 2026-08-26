@@ -9,6 +9,27 @@ class UserCreate(BaseModel):
     password: str = Field(min_length=8, max_length=128)
     turnstile_token: str | None = Field(default=None, max_length=2048)
 
+class GoogleRegistrationComplete(BaseModel):
+    """
+    Final step for a Google-authenticated user who does not yet have a
+    GermFx account.
+
+    Email and Google subject are deliberately NOT accepted from the browser.
+    They come from the short-lived, signed Google-registration cookie.
+    """
+    username: str = Field(min_length=4, max_length=20)
+    accepted: bool
+    turnstile_token: str | None = Field(default=None, max_length=2048)
+
+    @model_validator(mode="after")
+    def validate_terms_acceptance(self):
+        if not self.accepted:
+            raise ValueError(
+                "You must agree to the Terms of Service and Privacy Policy"
+            )
+        return self
+
+
 class UserOut(BaseModel):
     id: int
     username: str
@@ -35,7 +56,13 @@ class UserLogin(BaseModel):
 
 
 class ChangePasswordRequest(BaseModel):
-    current_password: str = Field(min_length=1)
+    # Password users normally send this value. A user who also has a linked
+    # Google identity may omit it after completing recent Google reauth.
+    current_password: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
     new_password: str = Field(min_length=8, max_length=128)
     confirm_new_password: str = Field(min_length=8, max_length=128)
 
@@ -44,8 +71,31 @@ class ChangePasswordRequest(BaseModel):
         if self.new_password != self.confirm_new_password:
             raise ValueError("New passwords do not match")
 
-        if self.current_password == self.new_password:
-            raise ValueError("New password must be different from current password")
+        if (
+            self.current_password
+            and self.current_password == self.new_password
+        ):
+            raise ValueError(
+                "New password must be different from current password"
+            )
+
+        return self
+
+
+class SetPasswordRequest(BaseModel):
+    """
+    Used only when the account does not yet have a GermFx password.
+
+    Identity proof comes from the short-lived recent-auth cookie issued after
+    Google reauthentication, never from the browser payload.
+    """
+    new_password: str = Field(min_length=8, max_length=128)
+    confirm_new_password: str = Field(min_length=8, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_passwords(self):
+        if self.new_password != self.confirm_new_password:
+            raise ValueError("New passwords do not match")
 
         return self
 
@@ -55,7 +105,13 @@ class ChangeUsernameRequest(BaseModel):
 
 
 class ChangeEmailRequest(BaseModel):
-    current_password: str = Field(min_length=1)
+    # Optional because OAuth-only users verify with the short-lived recent-auth
+    # cookie instead of a GermFx password.
+    current_password: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
     new_email: EmailStr
     confirm_new_email: EmailStr
 
@@ -85,11 +141,26 @@ class ResetPasswordRequest(BaseModel):
         return self
 
 class ConfirmPasswordRequest(BaseModel):
-    current_password: str = Field(min_length=1)
+    # Password-authenticated users send this value.
+    # OAuth-only users may omit it and instead satisfy sensitive-action
+    # verification through the short-lived HttpOnly recent-auth cookie.
+    current_password: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
+
 
 class DeleteAccountRequest(BaseModel):
-    current_password: str = Field(min_length=1)
-    confirmation_text: str = Field(min_length=1)
+    # Same authentication rule as ConfirmPasswordRequest. The DELETE text is
+    # always required regardless of which authentication method confirms the
+    # user's identity.
+    current_password: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
+    confirmation_text: str = Field(min_length=1, max_length=32)
 
 class ReactivateAccountRequest(BaseModel):
     identifier: str = Field(min_length=3)

@@ -33,3 +33,6 @@ boto3
 
 # For PDF generation 
 reportlab
+
+# google auth
+google-auth
