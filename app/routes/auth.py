@@ -485,6 +485,46 @@ def _clear_recent_auth_cookie(
     )
 
 
+@router.get("/recent-auth-status", status_code=status.HTTP_200_OK)
+def recent_auth_status(
+    recent_auth_token: str | None = Cookie(
+        default=None,
+        alias=RECENT_AUTH_COOKIE,
+    ),
+    current_user: models.User = Depends(get_authenticated_user),
+):
+    """
+    Confirm whether the current authenticated GermFx user has a valid,
+    short-lived Google reauthentication proof.
+
+    Missing, expired, revoked, mismatched, or non-Google recent-auth tokens
+    are rejected by verify_recent_auth_for_user with a structured 403 error.
+    The frontend should treat those responses as "verification required"
+    rather than trusting a query-string flag such as ?reauth=success.
+    """
+    payload = verify_recent_auth_for_user(
+        recent_auth_token,
+        user=current_user,
+        allowed_providers={"google"},
+    )
+
+    provider = str(
+        payload.get("provider") or ""
+    ).strip().lower()
+
+    return {
+        "verified": True,
+        "provider": provider,
+        "expires_at": payload.get("exp"),
+        "has_password": bool(
+            current_user.password_hash
+        ),
+        "eligible_for_set_password": (
+            not bool(current_user.password_hash)
+        ),
+    }
+
+
 @router.post("/change-password", status_code=status.HTTP_200_OK)
 def change_password(
     payload: ChangePasswordRequest,
