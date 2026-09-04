@@ -749,3 +749,64 @@ def handle_google_callback(
         registration_token=registration_token,
         verified_email=verified_email,
     )
+
+def resolve_mobile_google_user(
+    db: Session,
+    *,
+    raw_id_token: str,
+) -> models.User:
+    """
+    Authenticate an existing GermFx user from a Google ID token
+    obtained by the native/mobile application.
+
+    This intentionally reuses the same Google identity verification
+    and account-linking rules as the browser OAuth flow.
+
+    It does not create a brand-new GermFx account. Mobile Google
+    registration will use its own registration flow later.
+    """
+    token = str(
+        raw_id_token or ""
+    ).strip()
+
+    if not token:
+        raise GoogleOAuthError(
+            "Google identity token is missing.",
+            code="GOOGLE_ID_TOKEN_MISSING",
+            status_code=400,
+        )
+
+    # _extract_verified_identity already:
+    #
+    # - verifies Google's signature
+    # - verifies the token audience
+    # - reads Google's immutable sub
+    # - requires an email address
+    # - requires email_verified
+    provider_subject, verified_email = (
+        _extract_verified_identity(
+            {
+                "id_token": token,
+            }
+        )
+    )
+
+    user = resolve_existing_google_user(
+        db,
+        provider_subject=
+            provider_subject,
+        verified_email=
+            verified_email,
+    )
+
+    if not user:
+        raise GoogleOAuthError(
+            (
+                "No existing GermFx account matches this Google account. "
+                "Create a GermFx account first, then try Google sign in again."
+            ),
+            code="GOOGLE_ACCOUNT_NOT_FOUND",
+            status_code=404,
+        )
+
+    return user

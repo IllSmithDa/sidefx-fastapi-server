@@ -17,6 +17,11 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from pydantic import (
+    BaseModel,
+    Field,
+)
+
 from app.core.auth import (
     RECENT_AUTH_COOKIE,
     RECENT_AUTH_TOKEN_SECONDS,
@@ -49,6 +54,7 @@ from app.services.google_auth import (
     is_google_oauth_configured,
     normalize_google_oauth_intent,
     resolve_existing_google_user,
+    resolve_mobile_google_user,
     verify_google_registration_token,
 )
 from app.services.turnstile import verify_turnstile_token
@@ -171,6 +177,99 @@ def google_auth_status():
         "provider": "google",
     }
 
+@router.post("/mobile")
+def google_mobile_login(
+    payload:
+        GoogleMobileLoginRequest,
+
+    response:
+        Response,
+
+    db:
+        Session = Depends(
+            get_db
+        ),
+):
+    """
+    Authenticate an existing GermFx account using a Google
+    ID token obtained by the native mobile application.
+
+    Unlike the browser OAuth flow, this route does not depend
+    on OAuth state cookies or the browser callback.
+
+    React Native receives GermFx access and refresh tokens
+    directly in the JSON response and uses them as Bearer tokens.
+    """
+    try:
+        user = resolve_mobile_google_user(
+            db,
+            raw_id_token=
+                payload.id_token,
+        )
+
+    except GoogleOAuthError as exc:
+        raise _google_oauth_http_exception(
+            exc
+        ) from exc
+
+    access_token, refresh_token = (
+        _issue_user_session(
+            user,
+            response,
+        )
+    )
+
+    return {
+        "user": {
+            "id":
+                user.id,
+
+            "username":
+                user.username,
+
+            "is_active":
+                user.is_active,
+
+            "is_email_verified":
+                user.is_email_verified,
+
+            "account_status":
+                getattr(
+                    user,
+                    "account_status",
+                    None,
+                ),
+
+            "created_at":
+                user.created_at,
+
+            "has_password":
+                bool(
+                    user.password_hash
+                ),
+
+            # A successful request here guarantees that this
+            # GermFx account is linked to Google.
+            "oauth_providers": [
+                "google"
+            ],
+        },
+
+        "access_token":
+            access_token,
+
+        "refresh_token":
+            refresh_token,
+
+        "token_type":
+            "bearer",
+
+        "provider":
+            "google",
+
+        "action":
+            "authenticated",
+    }
 
 @router.get("/login")
 def google_login(
